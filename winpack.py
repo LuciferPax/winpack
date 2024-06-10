@@ -2,6 +2,7 @@ import os
 import tarfile
 import logging
 import json
+import subprocess
 from packaging import version
 from packaging.specifiers import SpecifierSet
 from github import Github
@@ -11,7 +12,29 @@ logging.basicConfig(format='%(asctime)s - %(message)s', level=logging.INFO)
 
 repo_url = "Bractothorpe/pkg"
 
-def fetch_package(branch_name, expected_version=None, lockfile=None):
+def run_build_commands(commands, directory):
+    try:
+        for command in commands:
+            logging.info(f"Running build command: {command}")
+            result = subprocess.run(command, shell=True, cwd=directory, check=True, capture_output=True)
+            logging.info(result.stdout.decode())
+            if result.stderr:
+                logging.error(result.stderr.decode())
+    except subprocess.CalledProcessError as e:
+        logging.error(f"Build command failed: {e}")
+        return False
+    return True
+
+def fetch_package(branch_name, expected_version=None, lockfile=None, resolved_packages=None):
+    if resolved_packages is None:
+        resolved_packages = set()
+        
+    if branch_name in resolved_packages:
+        logging.error(f"Circular dependency detected: {branch_name} is already being resolved")
+        return False
+    
+    resolved_packages.add(branch_name)
+    
     try:
         # Create a Github instance
         g = Github()
@@ -72,7 +95,7 @@ def fetch_package(branch_name, expected_version=None, lockfile=None):
                 logging.info(f"Resolving dependency {package_name}")
                 if package_name not in lockfile["dependencies"]:
                     dependency_lockfile = {"version": None, "dependencies": {}}
-                    if not fetch_package(package_name, package_version, dependency_lockfile):
+                    if not fetch_package(package_name, package_version, dependency_lockfile, resolved_packages):
                         logging.error(f"Failed to fetch dependency {package_name}")
                         return False
                     lockfile["dependencies"][package_name] = dependency_lockfile
@@ -107,7 +130,7 @@ def fetch_package(branch_name, expected_version=None, lockfile=None):
 
             # Extract the tar.gz file
             with tarfile.open(local_tarball_path, mode="r:gz") as tar:
-                tar.extractall(f"packages/{branch_name}", filter=None)
+                tar.extractall(f"packages/{branch_name}")
 
             # Delete the tar.gz file after extraction
             os.remove(local_tarball_path)
@@ -115,6 +138,17 @@ def fetch_package(branch_name, expected_version=None, lockfile=None):
         logging.error(f"Failed to download and extract tarball: {e}")
         return False
 
+    try:
+        # Run build commands if present
+        if "build" in package_json:
+            build_commands = package_json["build"]
+            if not run_build_commands(build_commands, f"packages/{branch_name}"):
+                return False
+    except Exception as e:
+        logging.error(f"Failed to run build commands: {e}")
+        return False
+
+    resolved_packages.remove(branch_name)
     return True
 
 def uninstall_package(branch_name):
@@ -139,33 +173,32 @@ def install_package(branch_name):
     return True
 
 def update_package(branch_name):
-  # get the package in the repository
-  g = Github()
-  repo = g.get_repo(repo_url)
-  branch = repo.get_branch(branch_name)
+    try:
+        # get the package in the repository
+        g = Github()
+        repo = g.get_repo(repo_url)
+        branch = repo.get_branch(branch_name)
+        tree = repo.get_git_tree(branch.commit.sha, recursive=True).tree
+        package_json = None
+        
+        for item in tree:
+            if item.path == "package.json":
+                file_contents = repo.get_contents(item.path, ref=branch.commit.sha)
+                package_json = json.loads(file_contents.decoded_content)
 
-  tree = repo.get_git_tree(branch.commit.sha, recursive=True).tree
-  package_json = None
-  try:
-    for item in tree:
-      if item.path == "package.json":
-        file_contents = repo.get_contents(item.path, ref=branch.commit.sha)
-        package_json = json.loads(file_contents.decoded_content)
-
-        with open(f"packages/{branch_name}/package-lock.json", "r") as f:
-          lockfile = json.load(f)
-          # check if the version is different
-          if package_json.get("version") > lockfile.get("version"):
-            uninstall_package(branch_name)
-            install_package(branch_name)
-            return True
-          else:
-            logging.info(f"Package {branch_name} is already up to date")
-            return False
-  except Exception as e:
-    logging.error(f"Failed to update package {branch_name}: {e}")
-    return False
-      
+                with open(f"packages/{branch_name}/package-lock.json", "r") as f:
+                    lockfile = json.load(f)
+                    # check if the version is different
+                    if package_json.get("version") > lockfile.get("version"):
+                        uninstall_package(branch_name)
+                        install_package(branch_name)
+                        return True
+                    else:
+                        logging.info(f"Package {branch_name} is already up to date")
+                        return False
+    except Exception as e:
+        logging.error(f"Failed to update package {branch_name}: {e}")
+        return False
 
 # Example usage
 install_package("test")
